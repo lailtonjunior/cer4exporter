@@ -251,11 +251,9 @@ class BPAExporter:
                 
             # Somar com a quantidade - garantir que é um inteiro
             try:
-                # Se for string, converter para inteiro
-                if isinstance(reg['prd_qt'], str):
-                    quantidade = int(reg['prd_qt'].strip()) if reg['prd_qt'].strip() else 0
-                else:
-                    quantidade = int(reg['prd_qt']) if reg['prd_qt'] else 0
+                # Remover formatação e converter para inteiro
+                quantidade_str = str(reg['prd_qt']).replace('.', '')
+                quantidade = int(quantidade_str) if quantidade_str.strip() else 0
             except (ValueError, TypeError):
                 quantidade = 0
                 
@@ -294,7 +292,7 @@ class BPAExporter:
         
         return header
     
-    def consultar_dados(self, data_inicio, data_fim):
+    def consultar_dados(self, data_inicio, data_fim, competencia=None):
         """Consulta os dados no banco para o período especificado"""
         try:
             print("\nIniciando consulta de dados para o período de", data_inicio, "a", data_fim)
@@ -390,32 +388,40 @@ class BPAExporter:
                 )
             
             # Construir a consulta final
-            from sqlalchemy import select, and_
+            from sqlalchemy import select, and_, text
+            
+            # Usar parâmetros nomeados em vez de literais para as datas
+            # Isso resolverá o problema de renderização de data
             query = (
                 select(*todas_colunas)
                 .select_from(join_expr)
                 .where(
                     and_(
-                        self.ficha_amb_int.c.data_atendimento >= data_inicio,
-                        self.ficha_amb_int.c.data_atendimento <= data_fim
+                        self.ficha_amb_int.c.data_atendimento >= text(':data_inicio'),
+                        self.ficha_amb_int.c.data_atendimento <= text(':data_fim')
                     )
                 )
                 .limit(100)  # Limitar a 100 registros para teste
             )
             
-            # Para ajudar na depuração, imprimir a consulta SQL
-            from sqlalchemy import text
-            sql_text = str(query.compile(dialect=self.engine.dialect, compile_kwargs={"literal_binds": True}))
-            print("SQL gerada:", sql_text)
+            # Parâmetros para a consulta
+            params = {
+                'data_inicio': data_inicio,
+                'data_fim': data_fim
+            }
+            
+            # Remover a linha que causa o erro - não é necessária para a operação real
+            # sql_text = str(query.compile(dialect=self.engine.dialect, compile_kwargs={"literal_binds": True}))
+            # print("SQL gerada:", sql_text)
 
-            # Executar a consulta
+            # Executar a consulta com os parâmetros
             print("Executando consulta SQL...")
-            result = self.conn.execute(query)
-            registros = [dict(row) for row in result.mappings()]  # Adicione .mappings() aqui
+            result = self.conn.execute(query, params)
+            registros = [dict(row) for row in result.mappings()]
             print(f"Encontrados {len(registros)} registros.")
             
             # Processar os registros para o formato BPA-I
-            return self.processar_registros_bpa_i(registros)
+            return self.processar_registros_bpa_i(registros, competencia)
             
         except Exception as e:
             print(f"Erro ao consultar dados: {str(e)}")
@@ -533,25 +539,28 @@ class BPAExporter:
             traceback.print_exc()
             return []
 
-    def processar_registros_bpa_i(self, registros_bd):
+    def processar_registros_bpa_i(self, registros_bd, competencia=None):
         """Processa os registros do banco para o formato BPA-I"""
         registros_bpa_i = []
-        competencia = datetime.datetime.now().strftime("%Y%m")
+        
+        # Se competência não foi fornecida, usar a atual
+        if competencia is None:
+            competencia = datetime.datetime.now().strftime("%Y%m")
         
         # Carregar a tabela de procedimentos/CID
         tabela_proc_cid = self.carregar_tabela_procedimentos_cid()
         
         for i, reg in enumerate(registros_bd):
-            # Calcular folha e sequência
-            folha = math.floor(i / 20) + 1
-            sequencia = (i % 20) + 1
+            # Calcular folha e sequência - agora vai até 99 por folha
+            folha = math.floor(i / 99) + 1
+            sequencia = (i % 99) + 1
             
             # Obter código do procedimento
             cod_proc_bd = reg.get('cod_proc')
             cod_proc_completo = '0301010013'  # Valor padrão
             cid_sugestao = None
             servico = '135'  # Tipo de serviço sempre 135
-            classificacao = ''
+            classificacao = '000'  # Valor padrão
             
             # Buscar o procedimento na tabela de procedimentos/CID
             if cod_proc_bd and str(cod_proc_bd).strip():
@@ -574,7 +583,7 @@ class BPAExporter:
                 cid = cid_sugestao
             else:
                 cid = 'Z000'  # Valor padrão
-                
+                    
             # Obter quantidade (em ordem de prioridade)
             quantidade = 1  # Valor padrão
             if reg.get('quantidade'):
@@ -583,6 +592,9 @@ class BPAExporter:
                 quantidade = reg.get('qtd_autorizada')
             elif reg.get('qtd_solicitada'):
                 quantidade = reg.get('qtd_solicitada')
+            
+            # Formatar quantidade corretamente
+            quantidade_formatada = str(int(quantidade)).zfill(6)
             
             # Mapear sexo
             sexo = 'M'  # Valor padrão
@@ -603,6 +615,25 @@ class BPAExporter:
                 if (data_atend.month, data_atend.day) < (data_nasc.month, data_nasc.day):
                     idade -= 1
             
+            # Mapear raça corretamente
+            raca = '01'  # Branca (valor padrão)
+            if reg.get('cod_raca'):
+                raca_bd = str(reg.get('cod_raca'))
+                # Mapeamento do banco para o BPA
+                mapeamento_raca = {
+                    '1': '01',  # Branca 
+                    '2': '02',  # Preta
+                    '3': '03',  # Parda
+                    '4': '04',  # Amarela
+                    '5': '05',  # Indígena
+                }
+                raca = mapeamento_raca.get(raca_bd, '01')  # Padrão para branca se não encontrado
+            
+            # Verificar etnia para indígenas
+            etnia = '0000'  # Valor padrão
+            if raca == '05' and reg.get('cod_etnia'):
+                etnia = str(reg.get('cod_etnia')).zfill(4)
+            
             # Obter o tipo de função para este registro específico
             tp_funcao = reg.get('tp_funcao')
             
@@ -622,17 +653,17 @@ class BPAExporter:
                 'prd_ibge': str(reg.get('cod_municipio') or '170550').zfill(6),  # Código IBGE do município
                 'prd_cid': str(cid)[:4].ljust(4),  # CID-10 (4 primeiros caracteres)
                 'prd_ldade': str(idade).zfill(3),  # Idade
-                'prd_qt': str(quantidade).zfill(6),  # Quantidade de procedimentos
+                'prd_qt': quantidade_formatada,  # Quantidade de procedimentos com zeros à esquerda
                 'prd_caten': str(reg.get('urgente_eletivo') or '01').zfill(2),  # Caract. atendimento, geralmente eletivo
                 'prd_naut': str(reg.get('numero_guia') or '').ljust(13),  # Nº Autorização
                 'prd_org': 'BPA',  # Origem das informações
                 'prd_nmpac': str(reg.get('nm_paciente') or '').ljust(30)[:30],  # Nome do paciente
                 'prd_dtnasc': reg['data_nasc'].strftime('%Y%m%d') if reg.get('data_nasc') else '',  # Data de nasc.
-                'prd_raca': str(reg.get('cod_raca') or '01').zfill(2),  # Raça/Cor
-                'prd_etnia': ''.zfill(4),  # Etnia (não aplicável)
+                'prd_raca': raca.zfill(2),  # Raça/Cor
+                'prd_etnia': etnia,  # Etnia (verificada para indígenas)
                 'prd_nac': '010'.zfill(3),  # Nacionalidade (brasileiro)
                 'prd_srv': servico.zfill(3),  # Código do Serviço (135)
-                'prd_clf': classificacao.zfill(3),  # Código da Classificação
+                'prd_clf': classificacao.zfill(3),  # Código da Classificação baseado no tipo de reabilitação
                 'prd_equipe_Seq': ''.zfill(8),  # Código Sequência Equipe (zerado)
                 'prd_equipe_Area': ''.zfill(4),  # Código Área Equipe (zerado)
                 'prd_cnpj': ''.zfill(14),  # CNPJ da empresa (zerado)
@@ -653,7 +684,6 @@ class BPAExporter:
             registros_bpa_i.append(registro_bpa_i)
         
         return registros_bpa_i
-
 
     def carregar_tabela_procedimentos_cid(self):
         """Carrega a tabela de procedimentos e CIDs para consulta"""
@@ -917,37 +947,37 @@ class BPAExporterGUI:
         # Elementos de configuração
         ttk.Label(self.frame_config, text="Órgão Responsável:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.orgao_resp = ttk.Entry(self.frame_config, width=30)
-        self.orgao_resp.insert(0, "NOME DA CLINICA")
+        self.orgao_resp.insert(0, "APAE COLINAS")
         self.orgao_resp.grid(row=0, column=1, padx=5, pady=5, sticky="w")
         
         ttk.Label(self.frame_config, text="Sigla:").grid(row=0, column=2, padx=5, pady=5, sticky="w")
         self.sigla = ttk.Entry(self.frame_config, width=6)
-        self.sigla.insert(0, "SIGLA")
+        self.sigla.insert(0, "AP")
         self.sigla.grid(row=0, column=3, padx=5, pady=5, sticky="w")
         
         ttk.Label(self.frame_config, text="CNPJ/CPF:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         self.cnpj_cpf = ttk.Entry(self.frame_config, width=14)
-        self.cnpj_cpf.insert(0, "00000000000000")
+        self.cnpj_cpf.insert(0, "25062282000182")
         self.cnpj_cpf.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         
         ttk.Label(self.frame_config, text="Órgão Destino:").grid(row=1, column=2, padx=5, pady=5, sticky="w")
         self.orgao_destino = ttk.Entry(self.frame_config, width=40)
-        self.orgao_destino.insert(0, "SECRETARIA MUNICIPAL DE SAUDE")
+        self.orgao_destino.insert(0, "SESAU")
         self.orgao_destino.grid(row=1, column=3, padx=5, pady=5, sticky="w")
         
         ttk.Label(self.frame_config, text="Indicador Destino:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
-        self.indicador_destino = ttk.Combobox(self.frame_config, values=["M", "E"], width=2)
+        self.indicador_destino = ttk.Combobox(self.frame_config, values=["E"], width=2)
         self.indicador_destino.current(0)
         self.indicador_destino.grid(row=2, column=1, padx=5, pady=5, sticky="w")
         
         ttk.Label(self.frame_config, text="Versão Sistema:").grid(row=2, column=2, padx=5, pady=5, sticky="w")
         self.versao = ttk.Entry(self.frame_config, width=10)
-        self.versao.insert(0, "v1.0.0")
+        self.versao.insert(0, "04.10")
         self.versao.grid(row=2, column=3, padx=5, pady=5, sticky="w")
         
         ttk.Label(self.frame_config, text="CNES:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
         self.cnes = ttk.Entry(self.frame_config, width=7)
-        self.cnes.insert(0, "0000000")
+        self.cnes.insert(0, "2560372")
         self.cnes.grid(row=3, column=1, padx=5, pady=5, sticky="w")
         
         # Elementos de ação
@@ -1066,13 +1096,16 @@ class BPAExporterGUI:
         # Obter competência
         competencia = self.competencia.get()
         
+        # Atualizar a competência no exportador
+        self.exporter.competencia = competencia
+        
         # Converter competência para formato de extensão
         try:
             mes_num = int(competencia[-2:])
             meses = ['JAN', 'FEV', 'MAR', 'ABR', 'MAI', 'JUN', 'JUL', 'AGO', 'SET', 'OUT', 'NOV', 'DEZ']
             extensao = meses[mes_num - 1]  # -1 porque listas começam em 0
         except (ValueError, IndexError):
-            messagebox.showerror("Erro", "Competência inválida. Use o formato AAAAMM (ex: 202501)")
+            messagebox.showerror("Erro", "Competência inválida. Use o formato AAAAMM (ex: 202504)")
             return
         
         # Informar ao usuário o formato do arquivo
