@@ -200,6 +200,14 @@ class BPAExporter:
                 self.procedimentos_fia = Table('procedimentos_fia', metadata, autoload_with=self.engine, schema=esquema)
                 print("Tabela procedimentos_fia carregada com sucesso")
                 
+                # Tabela procedimentos
+                try:
+                    self.procedimentos = Table('procedimentos', metadata, autoload_with=self.engine, schema=esquema)
+                    print("Tabela procedimentos carregada com sucesso")
+                except Exception as e:
+                    print(f"Aviso: Não foi possível carregar a tabela procedimentos: {str(e)}")
+                    self.procedimentos = None
+                
                 # Tabela pacientes
                 try:
                     self.pacientes = Table('pacientes', metadata, autoload_with=self.engine, schema=esquema)
@@ -297,6 +305,54 @@ class BPAExporter:
         try:
             print("\nIniciando consulta de dados para o período de", data_inicio, "a", data_fim)
             
+            # Verificar o formato da competência
+            if competencia is not None:
+                # Garantir que a competência tenha 6 dígitos (AAAAMM)
+                if len(competencia) != 6:
+                    print(f"AVISO: Formato de competência incorreto: {competencia}. Use o formato AAAAMM (ex: 202504)")
+                    competencia = datetime.datetime.now().strftime("%Y%m")
+                    print(f"Competência ajustada para: {competencia}")
+            else:
+                # Se não foi fornecida, usar a atual no formato AAAAMM
+                competencia = datetime.datetime.now().strftime("%Y%m")
+                print(f"Competência não fornecida, usando a atual: {competencia}")
+            
+            # Construir a consulta SQL diretamente
+            # Isso evita problemas com a reflexão de tabelas e joins
+            try:
+                print("Consultando diretamente com SQL")
+                from sqlalchemy import text
+                
+                # Usar text() para evitar problemas com o tipo de data
+                data_inicio_str = data_inicio.isoformat() if isinstance(data_inicio, datetime.date) else data_inicio
+                data_fim_str = data_fim.isoformat() if isinstance(data_fim, datetime.date) else data_fim
+                
+                # Consulta SQL simplificada
+                sql = """
+                SELECT fi.id_fia, fi.cod_paciente, fi.cod_medico, fi.numero_guia, fi.diagnostico, 
+                    fi.tipo_atend, fi.data_atendimento, fi.cod_municipio, fi.complemento, 
+                    fi.num_end_resp, fi.cod_logradouro, fi.cod_bairro, fi.cod_cep, 
+                    fi.fone_resp, fi.matricula AS cnspac,
+                    l.id_lancamento, l.cod_proc, l.quantidade, l.cod_cid AS lanc_cod_cid, l.cod_serv
+                FROM sigh.ficha_amb_int AS fi
+                JOIN sigh.lancamentos AS l ON fi.id_fia = l.cod_conta
+                WHERE fi.data_atendimento BETWEEN :data_inicio AND :data_fim
+                LIMIT 100
+                """
+                
+                # Executar consulta parametrizada
+                result = self.conn.execute(text(sql), {"data_inicio": data_inicio_str, "data_fim": data_fim_str})
+                registros = [dict(row) for row in result]
+                print(f"Encontrados {len(registros)} registros na consulta simples")
+                
+                if registros:
+                    return self.processar_registros_bpa_i(registros, competencia)
+            except Exception as e:
+                print(f"Erro na consulta SQL: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            
+            # Se a consulta SQL direta falhar, tentar o método original
             # Definir as colunas relevantes
             # Colunas da ficha_amb_int
             colunas_ficha = [
@@ -387,42 +443,75 @@ class BPAExporter:
                     self.ficha_amb_int.c.cod_medico == self.prestadores.c.id_prestador
                 )
             
+            # Converter datas para datetime.date se forem strings
+            if isinstance(data_inicio, str):
+                # Tentar interpretar a data - suporta diferentes formatos
+                try:
+                    data_inicio = datetime.datetime.strptime(data_inicio, '%Y-%m-%d').date()
+                except ValueError:
+                    try:
+                        data_inicio = datetime.datetime.strptime(data_inicio, '%d/%m/%Y').date()
+                    except ValueError:
+                        pass  # Manter como string se não conseguir converter
+            
+            if isinstance(data_fim, str):
+                # Tentar interpretar a data - suporta diferentes formatos
+                try:
+                    data_fim = datetime.datetime.strptime(data_fim, '%Y-%m-%d').date()
+                except ValueError:
+                    try:
+                        data_fim = datetime.datetime.strptime(data_fim, '%d/%m/%Y').date()
+                    except ValueError:
+                        pass  # Manter como string se não conseguir converter
+            
+            # Imprimir valores convertidos para depuração
+            print(f"Data início (convertida): {data_inicio}, tipo: {type(data_inicio)}")
+            print(f"Data fim (convertida): {data_fim}, tipo: {type(data_fim)}")
+            
             # Construir a consulta final
-            from sqlalchemy import select, and_, text
+            from sqlalchemy import select, and_, func, text
             
-            # Usar parâmetros nomeados em vez de literais para as datas
-            # Isso resolverá o problema de renderização de data
-            query = (
-                select(*todas_colunas)
-                .select_from(join_expr)
-                .where(
-                    and_(
-                        self.ficha_amb_int.c.data_atendimento >= text(':data_inicio'),
-                        self.ficha_amb_int.c.data_atendimento <= text(':data_fim')
+            # TENTATIVA 1: Usando consulta parametrizada com datas como objetos
+            try:
+                print("TENTATIVA 1: Consulta com datas como objetos")
+                query = (
+                    select(*todas_colunas)
+                    .select_from(join_expr)
+                    .where(
+                        and_(
+                            self.ficha_amb_int.c.data_atendimento >= data_inicio,
+                            self.ficha_amb_int.c.data_atendimento <= data_fim
+                        )
                     )
+                    .limit(100)  # Limitar a 100 registros para teste
                 )
-                .limit(100)  # Limitar a 100 registros para teste
-            )
+                
+                result = self.conn.execute(query)
+                registros = [dict(row) for row in result.mappings()]
+                print(f"TENTATIVA 1: Encontrados {len(registros)} registros.")
+                
+                if registros:
+                    return self.processar_registros_bpa_i(registros, competencia)
+            except Exception as e:
+                print(f"TENTATIVA 1 falhou: {str(e)}")
+                registros = []
             
-            # Parâmetros para a consulta
-            params = {
-                'data_inicio': data_inicio,
-                'data_fim': data_fim
-            }
+            # TENTATIVA 2: Usando consulta simplificada
+            if not registros:
+                try:
+                    print("TENTATIVA 2: Consulta simplificada")
+                    registros_alt = self.consultar_apenas_ficha(data_inicio, data_fim)
+                    if registros_alt:
+                        print(f"TENTATIVA 2: Encontrados {len(registros_alt)} registros.")
+                        return registros_alt
+                except Exception as e:
+                    print(f"TENTATIVA 2 falhou: {str(e)}")
+                    registros_alt = []
             
-            # Remover a linha que causa o erro - não é necessária para a operação real
-            # sql_text = str(query.compile(dialect=self.engine.dialect, compile_kwargs={"literal_binds": True}))
-            # print("SQL gerada:", sql_text)
-
-            # Executar a consulta com os parâmetros
-            print("Executando consulta SQL...")
-            result = self.conn.execute(query, params)
-            registros = [dict(row) for row in result.mappings()]
-            print(f"Encontrados {len(registros)} registros.")
-            
-            # Processar os registros para o formato BPA-I
-            return self.processar_registros_bpa_i(registros, competencia)
-            
+            # Se nenhuma tentativa funcionou, retornar lista vazia
+            print("Nenhum registro encontrado em nenhuma tentativa.")
+            return []
+                
         except Exception as e:
             print(f"Erro ao consultar dados: {str(e)}")
             import traceback
@@ -433,6 +522,31 @@ class BPAExporter:
         """Consulta simplificada apenas na tabela ficha_amb_int"""
         try:
             print("Realizando consulta simplificada apenas na tabela ficha_amb_int...")
+            
+            # Converter datas para datetime.date se forem strings
+            if isinstance(data_inicio, str):
+                # Tentar interpretar a data - suporta diferentes formatos
+                try:
+                    data_inicio = datetime.datetime.strptime(data_inicio, '%Y-%m-%d').date()
+                except ValueError:
+                    try:
+                        data_inicio = datetime.datetime.strptime(data_inicio, '%d/%m/%Y').date()
+                    except ValueError:
+                        pass  # Manter como string se não conseguir converter
+            
+            if isinstance(data_fim, str):
+                # Tentar interpretar a data - suporta diferentes formatos
+                try:
+                    data_fim = datetime.datetime.strptime(data_fim, '%Y-%m-%d').date()
+                except ValueError:
+                    try:
+                        data_fim = datetime.datetime.strptime(data_fim, '%d/%m/%Y').date()
+                    except ValueError:
+                        pass  # Manter como string se não conseguir converter
+            
+            # Imprimir valores convertidos para depuração
+            print(f"Consulta simplificada - Data início: {data_inicio}, tipo: {type(data_inicio)}")
+            print(f"Consulta simplificada - Data fim: {data_fim}, tipo: {type(data_fim)}")
             
             # Definir colunas da ficha_amb_int
             colunas = [
@@ -447,20 +561,38 @@ class BPAExporter:
             ]
             
             # Construir consulta
-            from sqlalchemy import select, and_
+            from sqlalchemy import select, and_, text
+            
+            # Usar text() para evitar problemas com o tipo de data
+            data_inicio_str = data_inicio.isoformat() if isinstance(data_inicio, datetime.date) else data_inicio
+            data_fim_str = data_fim.isoformat() if isinstance(data_fim, datetime.date) else data_fim
+            
+            # Usar consulta parametrizada com text()
             query = (
                 select(colunas)
                 .where(
                     and_(
-                        self.ficha_amb_int.c.data_atendimento >= data_inicio,
-                        self.ficha_amb_int.c.data_atendimento <= data_fim
+                        self.ficha_amb_int.c.data_atendimento >= text(':data_inicio'),
+                        self.ficha_amb_int.c.data_atendimento <= text(':data_fim')
                     )
                 )
                 .limit(100)  # Limitar a 100 registros para teste
             )
             
-            # Executar consulta
-            result = self.conn.execute(query)
+            # Parâmetros para a consulta
+            params = {
+                'data_inicio': data_inicio_str,
+                'data_fim': data_fim_str
+            }
+            
+            # Executar consulta com parâmetros
+            print(f"Executando consulta SQL simplificada com params: {params}")
+            
+            # Forçar a impressão da consulta para debug
+            sql_text = str(query.compile(dialect=self.engine.dialect))
+            print(f"SQL simplificada: {sql_text}")
+            
+            result = self.conn.execute(query, params)
             registros = [dict(row) for row in result]
             print(f"Consulta simplificada encontrou {len(registros)} registros.")
             
@@ -547,6 +679,25 @@ class BPAExporter:
         if competencia is None:
             competencia = datetime.datetime.now().strftime("%Y%m")
         
+        print(f"Processando registros com competência: {competencia}")  # Log para depuração
+        print(f"Tipo dos registros: {type(registros_bd)}")
+        print(f"Número de registros: {len(registros_bd)}")
+        
+        # Debug - mostrar alguns registros para entender a estrutura
+        if registros_bd:
+            print("Amostra dos primeiros registros:")
+            for i, reg in enumerate(registros_bd[:3]):
+                print(f"Registro {i+1}: {reg}")
+
+        # Extrair os códigos de procedimentos únicos
+        cod_procs_bd = [reg.get('cod_proc') for reg in registros_bd if reg.get('cod_proc')]
+        cod_procs_bd_unicos = list(set(cod_procs_bd))
+        
+        print(f"Códigos de procedimentos únicos: {cod_procs_bd_unicos}")
+        
+        # Carregar o mapeamento de procedimentos
+        mapeamento_proc = self.carregar_mapeamento_procedimentos(cod_procs_bd_unicos)
+        
         # Carregar a tabela de procedimentos/CID
         tabela_proc_cid = self.carregar_tabela_procedimentos_cid()
         
@@ -561,29 +712,63 @@ class BPAExporter:
             cid_sugestao = None
             servico = '135'  # Tipo de serviço sempre 135
             classificacao = '000'  # Valor padrão
+            tipo_reabilitacao = ''  # Inicializar a variável aqui
             
-            # Buscar o procedimento na tabela de procedimentos/CID
+            # Buscar o procedimento usando o mapeamento duplo
             if cod_proc_bd and str(cod_proc_bd).strip():
-                proc_info = tabela_proc_cid.get(str(cod_proc_bd).strip())
-                if proc_info:
-                    cod_proc_completo = proc_info['codigo_sigtap']
-                    classificacao = proc_info['classificacao']
-                    if not (reg.get('lanc_cod_cid') or reg.get('proc_cod_cid') or reg.get('diagnostico')):
-                        cid_sugestao = proc_info['cid_sugestao']
+                # Primeiro mapear para codigo_procedimento
+                codigo_procedimento = mapeamento_proc.get(str(cod_proc_bd))
+                
+                if codigo_procedimento:
+                    print(f"Mapeamento: lancamentos.cod_proc={cod_proc_bd} -> procedimentos.codigo_procedimento={codigo_procedimento}")
+                    
+                    # Depois buscar na tabela_proc_cid
+                    proc_info = tabela_proc_cid.get(codigo_procedimento)
+                    if proc_info:
+                        cod_proc_completo = proc_info['codigo_sigtap']
+                        tipo_reabilitacao = proc_info.get('classificacao', '')
+                        print(f"Procedimento encontrado: {cod_proc_bd} -> {codigo_procedimento} -> {cod_proc_completo} (tipo: {tipo_reabilitacao})")
+                        
+                        # Verificar se precisamos obter o CID sugestão
+                        if not (reg.get('lanc_cod_cid') or reg.get('proc_cod_cid') or reg.get('diagnostico')):
+                            cid_sugestao = proc_info.get('cid_sugestao')
+                    else:
+                        print(f"Código de procedimento {codigo_procedimento} não encontrado na tabela_proc_cid")
+                else:
+                    print(f"Procedimento não encontrado na tabela: {cod_proc_bd}")
+                    # Usar o valor padrão
+                    cod_proc_completo = '0301010013'
             
-            # Obter CID (em ordem de prioridade)
+            # Mapeamento para códigos BPA
+            classificacao_map = {
+                '01': '001',  # Reabilitação Visual
+                '02': '002',  # Reabilitação Intelectual
+                '03': '003',  # Reabilitação Física
+                '05': '005',  # Reabilitação Auditiva
+            }
+            # Obter classificação mapeada
+            classificacao = classificacao_map.get(tipo_reabilitacao, '000')
+            
+            # Obter CID (em ordem de prioridade) com log para depuração
             cid = None
-            if reg.get('lanc_cod_cid'):  # Primeiro tentar CID do lancamento
-                cid = reg.get('lanc_cod_cid')
-            elif reg.get('proc_cod_cid'):  # Depois tentar CID do procedimento_fia
-                cid = reg.get('proc_cod_cid')
-            elif reg.get('diagnostico'):  # Depois tentar diagnóstico da ficha
-                cid = reg.get('diagnostico')
-            elif cid_sugestao:  # Por fim, usar CID sugestão da tabela
+            cid_origem = "padrão"
+            
+            if reg.get('lanc_cod_cid') and str(reg.get('lanc_cod_cid')).strip():
+                cid = str(reg.get('lanc_cod_cid')).strip()
+                cid_origem = "lancamentos.cod_cid"
+            elif reg.get('proc_cod_cid') and str(reg.get('proc_cod_cid')).strip():
+                cid = str(reg.get('proc_cod_cid')).strip()
+                cid_origem = "procedimentos_fia.cod_cid"
+            elif reg.get('diagnostico') and str(reg.get('diagnostico')).strip():
+                cid = str(reg.get('diagnostico')).strip()
+                cid_origem = "ficha_amb_int.diagnostico"
+            elif cid_sugestao:
                 cid = cid_sugestao
+                cid_origem = "cid_sugestao da tabela"
             else:
                 cid = 'Z000'  # Valor padrão
-                    
+                cid_origem = "valor padrão"
+            
             # Obter quantidade (em ordem de prioridade)
             quantidade = 1  # Valor padrão
             if reg.get('quantidade'):
@@ -595,13 +780,30 @@ class BPAExporter:
             
             # Formatar quantidade corretamente
             quantidade_formatada = str(int(quantidade)).zfill(6)
-            
+
+            # Obter código IBGE do município
+            cod_ibge = None
+            if reg.get('cod_ibge'):
+                cod_ibge = str(reg.get('cod_ibge'))
+            elif reg.get('cod_municipio'):
+                # Tentar mapear o código do município para IBGE
+                cod_municipio = str(reg.get('cod_municipio'))
+                # Aqui poderia ter uma tabela de mapeamento
+                # Por enquanto, usar o valor padrão para Colinas do Tocantins
+                cod_ibge = '170550'  # Valor padrão para Colinas do TO
+            else:
+                cod_ibge = '170550'  # Valor padrão
+
             # Mapear sexo
             sexo = 'M'  # Valor padrão
-            if reg.get('sexo') == '1':
-                sexo = 'M'
-            elif reg.get('sexo') == '3':
-                sexo = 'F'
+            if reg.get('sexo') is not None:
+                sexo_bd = str(reg.get('sexo')).strip()
+                print(f"Valor de sexo no BD: '{sexo_bd}'")  # Log para depuração
+                
+                if sexo_bd == '1':
+                    sexo = 'M'
+                elif sexo_bd == '3':
+                    sexo = 'F'
             
             # Obter CNS do paciente
             cnspac = str(reg.get('cnspac') or '').ljust(15)
@@ -650,7 +852,262 @@ class BPAExporter:
                 'prd_pa': str(cod_proc_completo).zfill(10),  # Código do procedimento completo
                 'prd_cnspac': cnspac,  # CNS do paciente 
                 'prd_sexo': sexo,  # Sexo do paciente
-                'prd_ibge': str(reg.get('cod_municipio') or '170550').zfill(6),  # Código IBGE do município
+                'prd_ibge': cod_ibge.zfill(6),  # Código IBGE do município
+                'prd_cid': str(cid)[:4].ljust(4),  # CID-10 (4 primeiros caracteres)
+                'prd_ldade': str(idade).zfill(3),  # Idade
+                'prd_qt': quantidade_formatada,  # Quantidade de procedimentos com zeros à esquerda
+                'prd_caten': str(reg.get('urgente_eletivo') or '01').zfill(2),  # Caract. atendimento, geralmente eletivo
+                'prd_naut': str(reg.get('numero_guia') or '').ljust(13),  # Nº Autorização
+                'prd_org': 'BPA',  # Origem das informações
+                'prd_nmpac': str(reg.get('nm_paciente') or 'PACIENTE').ljust(30)[:30],  # Nome do paciente
+                'prd_dtnasc': reg['data_nasc'].strftime('%Y%m%d') if reg.get('data_nasc') else '',  # Data de nasc.
+                'prd_raca': raca.zfill(2),  # Raça/Cor
+                'prd_etnia': etnia,  # Etnia (verificada para indígenas)
+                'prd_nac': '010'.zfill(3),  # Nacionalidade (brasileiro)
+                'prd_srv': servico.zfill(3),  # Código do Serviço (135)
+                'prd_clf': classificacao.zfill(3),  # Código da Classificação baseado no tipo de reabilitação
+                'prd_equipe_Seq': ''.zfill(8),  # Código Sequência Equipe (zerado)
+                'prd_equipe_Area': ''.zfill(4),  # Código Área Equipe (zerado)
+                'prd_cnpj': ''.zfill(14),  # CNPJ da empresa (zerado)
+                'prd_cep_pcnte': str(reg.get('cod_cep') or '').zfill(8),  # CEP do paciente
+                'prd_lograd_pcnte': str(reg.get('cod_logradouro') or '').zfill(3),  # Código logradouro
+                'prd_end_pcnte': ''.ljust(30),  # Endereço do paciente
+                'prd_compl_pcnte': str(reg.get('complemento') or '').ljust(10),  # Complemento endereço
+                'prd_num_pcnte': str(reg.get('num_end_resp') or '').ljust(5),  # Número do endereço
+                'prd_bairro_pcnte': ''.ljust(30),  # Bairro do paciente
+                'prd_ddtel_pcnte': str(reg.get('fone_resp') or '').ljust(11),  # Telefone do paciente
+                'prd_email_pcnte': str(reg.get('email') or '').ljust(40),  # E-mail do paciente
+                'prd_ine': ''.zfill(10),  # Identificação nacional de equipes (zerado)
+                'prd_cpf_pcnte': '00000000000',  # CPF do paciente (zerado)
+                'prd_situacao_rua': 'N',  # Pessoa em situação de rua
+                'prd_fim': '\r\n'  # CR+LF Quebra de linha no formato Windows
+            }
+            
+            registros_bpa_i.append(registro_bpa_i)
+        
+        print(f"Processados {len(registros_bpa_i)} registros BPA-I")
+        return registros_bpa_i
+        
+    def carregar_mapeamento_procedimentos(self, cod_procs):
+        """Carrega o mapeamento de cod_proc para codigo_procedimento"""
+        mapeamento_proc = {}
+        
+        if not cod_procs:
+            return mapeamento_proc
+        
+        try:
+            # Usar o esquema correto "sigh"
+            esquema = "sigh"
+            
+            # Criar uma representação temporária da tabela procedimentos
+            procedimentos = Table('procedimentos', MetaData(schema=esquema), 
+                                autoload_with=self.engine, schema=esquema)
+            
+            # Converter os códigos para strings
+            cod_procs_str = [str(cod) for cod in cod_procs]
+            
+            # Construir a consulta
+            from sqlalchemy import select
+            query = select(
+                procedimentos.c.id_procedimento,
+                procedimentos.c.codigo_procedimento
+            ).where(
+                procedimentos.c.id_procedimento.in_(cod_procs_str)
+            )
+            
+            # Executar a consulta
+            result = self.conn.execute(query)
+            
+            # Armazenar os resultados no mapeamento
+            for row in result:
+                mapeamento_proc[str(row['id_procedimento'])] = str(row['codigo_procedimento'])
+            
+            print(f"Mapeamento de procedimentos carregado: {len(mapeamento_proc)} códigos")
+            
+        except Exception as e:
+            print(f"Erro ao carregar mapeamento de procedimentos: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
+        return mapeamento_proc
+
+        # Consultar o mapeamento de cod_proc para codigo_procedimento
+        mapeamento_proc = {}
+        if cod_procs_bd_unicos and self.procedimentos is not None:
+            try:
+                from sqlalchemy import select
+                query = select(
+                    self.procedimentos.c.id_procedimento,
+                    self.procedimentos.c.codigo_procedimento
+                ).where(
+                    self.procedimentos.c.id_procedimento.in_(cod_procs_bd_unicos)
+                )
+                
+                result = self.conn.execute(query)
+                for row in result:
+                    mapeamento_proc[str(row['id_procedimento'])] = str(row['codigo_procedimento'])
+                
+                print(f"Mapeamento de procedimentos carregado: {len(mapeamento_proc)} códigos")
+            except Exception as e:
+                print(f"Erro ao carregar mapeamento de procedimentos: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        # Carregar a tabela de procedimentos/CID
+        tabela_proc_cid = self.carregar_tabela_procedimentos_cid()
+        
+        for i, reg in enumerate(registros_bd):
+            # Calcular folha e sequência - agora vai até 99 por folha
+            folha = math.floor(i / 99) + 1
+            sequencia = (i % 99) + 1
+            
+            # Obter código do procedimento
+            cod_proc_bd = reg.get('cod_proc')
+            cod_proc_completo = '0301010013'  # Valor padrão
+            cid_sugestao = None
+            servico = '135'  # Tipo de serviço sempre 135
+            classificacao = '000'  # Valor padrão
+            tipo_reabilitacao = ''  # Inicializar a variável aqui
+        
+        # Buscar o procedimento usando o mapeamento duplo
+        if cod_proc_bd and str(cod_proc_bd).strip():
+            # Primeiro mapear para codigo_procedimento
+            codigo_procedimento = mapeamento_proc.get(str(cod_proc_bd).strip())
+            
+            if codigo_procedimento:
+                print(f"Mapeamento: lancamentos.cod_proc={cod_proc_bd} -> procedimentos.codigo_procedimento={codigo_procedimento}")
+                
+                # Depois buscar na tabela_proc_cid
+                proc_info = tabela_proc_cid.get(codigo_procedimento)
+                if proc_info:
+                    cod_proc_completo = proc_info['codigo_sigtap']
+                    tipo_reabilitacao = proc_info.get('classificacao', '')
+                    print(f"Procedimento encontrado: {cod_proc_bd} -> {codigo_procedimento} -> {cod_proc_completo} (tipo: {tipo_reabilitacao})")
+                    
+                    # Verificar se precisamos obter o CID sugestão
+                    if not (reg.get('lanc_cod_cid') or reg.get('proc_cod_cid') or reg.get('diagnostico')):
+                        cid_sugestao = proc_info.get('cid_sugestao')
+                else:
+                    print(f"Código de procedimento {codigo_procedimento} não encontrado na tabela_proc_cid")
+            else:
+                print(f"Procedimento não encontrado na tabela: {cod_proc_bd}")
+                    
+            # Mapeamento para códigos BPA
+            classificacao_map = {
+                '01': '001',  # Reabilitação Visual
+                '02': '002',  # Reabilitação Intelectual
+                '03': '003',  # Reabilitação Física
+                '05': '005',  # Reabilitação Auditiva
+            }
+            # Obter classificação mapeada
+            classificacao = classificacao_map.get(tipo_reabilitacao, '000')
+            
+            # Obter CID (em ordem de prioridade) com log para depuração
+            cid = None
+            cid_origem = "padrão"
+            
+            if reg.get('lanc_cod_cid') and str(reg.get('lanc_cod_cid')).strip():
+                cid = str(reg.get('lanc_cod_cid')).strip()
+                cid_origem = "lancamentos.cod_cid"
+            elif reg.get('proc_cod_cid') and str(reg.get('proc_cod_cid')).strip():
+                cid = str(reg.get('proc_cod_cid')).strip()
+                cid_origem = "procedimentos_fia.cod_cid"
+            elif reg.get('diagnostico') and str(reg.get('diagnostico')).strip():
+                cid = str(reg.get('diagnostico')).strip()
+                cid_origem = "ficha_amb_int.diagnostico"
+            elif cid_sugestao:
+                cid = cid_sugestao
+                cid_origem = "cid_sugestao da tabela"
+            else:
+                cid = 'Z000'  # Valor padrão
+                cid_origem = "valor padrão"
+            
+            print(f"CID selecionado: {cid} (origem: {cid_origem})")  # Log para depuração
+
+            # Obter quantidade (em ordem de prioridade)
+            quantidade = 1  # Valor padrão
+            if reg.get('quantidade'):
+                quantidade = reg.get('quantidade')
+            elif reg.get('qtd_autorizada'):
+                quantidade = reg.get('qtd_autorizada')
+            elif reg.get('qtd_solicitada'):
+                quantidade = reg.get('qtd_solicitada')
+            
+            # Formatar quantidade corretamente
+            quantidade_formatada = str(int(quantidade)).zfill(6)
+
+            # Obter código IBGE do município
+            cod_ibge = None
+            if reg.get('cod_ibge'):
+                cod_ibge = str(reg.get('cod_ibge'))
+            elif reg.get('cod_municipio'):
+                # Tentar mapear o código do município para IBGE
+                cod_municipio = str(reg.get('cod_municipio'))
+                # Aqui poderia ter uma tabela de mapeamento
+                # Por enquanto, usar o valor padrão para Colinas do Tocantins
+                cod_ibge = '170550'  # Valor padrão para Colinas do TO
+            else:
+                cod_ibge = '170550'  # Valor padrão
+
+            # Mapear sexo
+            sexo = 'M'  # Valor padrão
+            if reg.get('sexo') is not None:
+                sexo_bd = str(reg.get('sexo')).strip()
+                print(f"Valor de sexo no BD: '{sexo_bd}'")  # Log para depuração
+                
+                if sexo_bd == '1':
+                    sexo = 'M'
+                elif sexo_bd == '3':
+                    sexo = 'F'
+            
+            # Obter CNS do paciente
+            cnspac = str(reg.get('cnspac') or '').ljust(15)
+            
+            # Calcular idade
+            idade = 0
+            if reg.get('data_nasc') and reg.get('data_atendimento'):
+                data_nasc = reg['data_nasc']
+                data_atend = reg['data_atendimento']
+                idade = data_atend.year - data_nasc.year
+                if (data_atend.month, data_atend.day) < (data_nasc.month, data_nasc.day):
+                    idade -= 1
+            
+            # Mapear raça corretamente
+            raca = '01'  # Branca (valor padrão)
+            if reg.get('cod_raca'):
+                raca_bd = str(reg.get('cod_raca'))
+                # Mapeamento do banco para o BPA
+                mapeamento_raca = {
+                    '1': '01',  # Branca 
+                    '2': '02',  # Preta
+                    '3': '03',  # Parda
+                    '4': '04',  # Amarela
+                    '5': '05',  # Indígena
+                }
+                raca = mapeamento_raca.get(raca_bd, '01')  # Padrão para branca se não encontrado
+            
+            # Verificar etnia para indígenas
+            etnia = '0000'  # Valor padrão
+            if raca == '05' and reg.get('cod_etnia'):
+                etnia = str(reg.get('cod_etnia')).zfill(4)
+            
+            # Obter o tipo de função para este registro específico
+            tp_funcao = reg.get('tp_funcao')
+            
+            # Criar registro BPA-I
+            registro_bpa_i = {
+                'prd_ident': '03',  # Identificação de linha de produção BPA-I
+                'prd_cnes': self.config['cnes'].zfill(7),  # Código CNES
+                'prd_cmp': competencia,  # Competência (AAAAMM)
+                'prd_cnsmed': str(reg.get('cns_med') or '').ljust(15),  # CNS do Profissional
+                'prd_cbo': self.obter_cbo_por_funcao(tp_funcao).ljust(6),  # CBO do Profissional baseado no tipo de função
+                'prd_dtaten': reg['data_atendimento'].strftime('%Y%m%d') if reg.get('data_atendimento') else '',  # Data de atendimento
+                'prd_flh': str(folha).zfill(3),  # Número da folha
+                'prd_seq': str(sequencia).zfill(2),  # Nº sequencial da linha
+                'prd_pa': str(cod_proc_completo).zfill(10),  # Código do procedimento completo
+                'prd_cnspac': cnspac,  # CNS do paciente 
+                'prd_sexo': sexo,  # Sexo do paciente
+                'prd_ibge': cod_ibge.zfill(6),  # Código IBGE do município
                 'prd_cid': str(cid)[:4].ljust(4),  # CID-10 (4 primeiros caracteres)
                 'prd_ldade': str(idade).zfill(3),  # Idade
                 'prd_qt': quantidade_formatada,  # Quantidade de procedimentos com zeros à esquerda
@@ -676,9 +1133,9 @@ class BPAExporter:
                 'prd_ddtel_pcnte': str(reg.get('fone_resp') or '').ljust(11),  # Telefone do paciente
                 'prd_email_pcnte': str(reg.get('email') or '').ljust(40),  # E-mail do paciente
                 'prd_ine': ''.zfill(10),  # Identificação nacional de equipes (zerado)
-                'prd_cpf_pcnte': ''.ljust(11),  # CPF do paciente (zerado)
-                'prd_situacao_rua': 'N',  # Pessoa em situação de rua
-                'prd_fim': '\r\n'  # CR+LF
+                'prd_cpf_pcnte': '00000000000',  # CPF do paciente (zerado)
+                'prd_situacao_rua': ' ',  # Pessoa em situação de rua
+                'prd_fim': '\r\n'  # CR+LF Quebra de linha no formato Windows
             }
             
             registros_bpa_i.append(registro_bpa_i)
@@ -762,6 +1219,18 @@ class BPAExporter:
     def gerar_arquivo_txt(self, competencia, registros, caminho_arquivo):
         """Gera arquivo de texto no formato BPA"""
         try:
+            # Log para depuração
+            print(f"\nExportando {len(registros)} registros com competência {competencia}")
+            print(f"Primeiros 3 registros (amostra):")
+            for i, reg in enumerate(registros[:3]):  # Mostrar primeiros 3 registros
+                print(f"  Registro {i+1}:")
+                print(f"    prd_cmp: {reg['prd_cmp']}")
+                print(f"    prd_pa: {reg['prd_pa']}")
+                print(f"    prd_sexo: {reg['prd_sexo']}")
+                print(f"    prd_ibge: {reg['prd_ibge']}")
+                print(f"    prd_cid: {reg['prd_cid']}")
+                print(f"    prd_clf: {reg['prd_clf']}")
+            
             # Converter competência para formato de extensão
             mes_num = int(competencia[-2:])
             meses = ['JAN', 'FEV', 'MAR', 'ABR', 'MAI', 'JUN', 'JUL', 'AGO', 'SET', 'OUT', 'NOV', 'DEZ']
@@ -1063,29 +1532,274 @@ class BPAExporterGUI:
             data_inicio = datetime.datetime.strptime(data_inicio_str, "%d/%m/%Y").date()
             data_fim = datetime.datetime.strptime(data_fim_str, "%d/%m/%Y").date()
             
-            self.log(f"Consultando dados de {data_inicio_str} até {data_fim_str}...")
+            # Obter competência e verificar o formato
+            competencia = self.competencia.get()
+            # Garantir que a competência tenha 6 dígitos (AAAAMM)
+            if len(competencia) != 6:
+                messagebox.showwarning("Aviso", "Formato de competência incorreto. Use o formato AAAAMM (ex: 202504)")
+                return
             
-            # Consultar dados
-            self.registros_bpa = self.exporter.consultar_dados(data_inicio, data_fim)
+            print(f"Competência selecionada na interface: {competencia}")
+            self.log(f"Consultando dados de {data_inicio_str} até {data_fim_str} com competência {competencia}...")
             
-            # Exibir quantidade de registros encontrados
+            # Consulta normal - usar o método do exporter
+            # Enviar as datas como strings ISO para evitar problemas de formato
+            self.registros_bpa = self.exporter.consultar_dados(
+                data_inicio.isoformat(), 
+                data_fim.isoformat(), 
+                competencia
+            )
+            
+            # Verificar se os registros foram processados corretamente
             if self.registros_bpa:
-                self.log(f"Encontrados {len(self.registros_bpa)} registros.")
+                # Adicionar logging para verificar o que veio do exporter
+                print(f"Recebidos {len(self.registros_bpa)} registros do exporter")
+                print(f"Tipo dos dados: {type(self.registros_bpa)}")
+                
+                if isinstance(self.registros_bpa, list) and len(self.registros_bpa) > 0:
+                    # Mostrar alguns campos do primeiro registro para debug
+                    primeiro_reg = self.registros_bpa[0]
+                    if isinstance(primeiro_reg, dict):
+                        print(f"Amostra do primeiro registro:")
+                        for campo in ['prd_ident', 'prd_cmp', 'prd_pa']:
+                            if campo in primeiro_reg:
+                                print(f"  {campo}: {primeiro_reg[campo]}")
+                    
+                    self.log(f"Encontrados {len(self.registros_bpa)} registros.")
+                    # Habilitar botões de exportação
+                    self.btn_exportar_txt.config(state="normal")
+                    self.btn_exportar_csv.config(state="normal")
+                    self.btn_exportar_xlsx.config(state="normal")
+                else:
+                    self.log("Erro ao processar registros: formato inválido.")
+                    # Mostrar mais detalhes no console
+                    print(f"Erro: registros_bpa não é uma lista válida ou está vazia")
+                    # Perguntar se deseja usar dados de teste
+                    mensagem = "Nenhum registro válido encontrado. Deseja criar dados de teste para validar o sistema?"
+                    resposta = messagebox.askyesno("Dados de Teste", mensagem)
+                    if resposta:
+                        self.log("Criando registros de teste...")
+                        # Criar registros de teste
+                        self.registros_bpa = self.criar_registros_teste(data_inicio, data_fim, competencia, 10)
+                        # Habilitar botões de exportação
+                        self.btn_exportar_txt.config(state="normal")
+                        self.btn_exportar_csv.config(state="normal")
+                        self.btn_exportar_xlsx.config(state="normal")
+                        self.log(f"Criados {len(self.registros_bpa)} registros de teste.")
+                    else:
+                        # Desabilitar botões de exportação
+                        self.btn_exportar_txt.config(state="disabled")
+                        self.btn_exportar_csv.config(state="disabled")
+                        self.btn_exportar_xlsx.config(state="disabled")
+            else:
+                self.log("Nenhum registro encontrado para o período especificado.")
+                
+                # Perguntar se deseja usar dados de teste
+                mensagem = "Nenhum registro encontrado. Deseja criar dados de teste para validar o sistema?"
+                resposta = messagebox.askyesno("Dados de Teste", mensagem)
+                if resposta:
+                    self.log("Criando registros de teste...")
+                    # Criar registros de teste
+                    self.registros_bpa = self.criar_registros_teste(data_inicio, data_fim, competencia, 10)
+                    # Habilitar botões de exportação
+                    self.btn_exportar_txt.config(state="normal")
+                    self.btn_exportar_csv.config(state="normal")
+                    self.btn_exportar_xlsx.config(state="normal")
+                    self.log(f"Criados {len(self.registros_bpa)} registros de teste.")
+                else:
+                    # Desabilitar botões de exportação
+                    self.btn_exportar_txt.config(state="disabled")
+                    self.btn_exportar_csv.config(state="disabled")
+                    self.btn_exportar_xlsx.config(state="disabled")
+                    messagebox.showinfo("Consulta", "Nenhum registro encontrado para o período especificado.")
+                    
+        except Exception as e:
+            self.log(f"Erro ao consultar dados: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Erro de Consulta", f"Falha ao consultar dados: {str(e)}")
+            
+            # Mesmo com erro, perguntar se deseja usar dados de teste
+            mensagem = "Erro ao consultar dados. Deseja criar dados de teste para validar o sistema?"
+            resposta = messagebox.askyesno("Dados de Teste", mensagem)
+            if resposta:
+                self.log("Criando registros de teste...")
+                # Criar registros de teste
+                self.registros_bpa = self.criar_registros_teste(data_inicio, data_fim, competencia, 10)
                 # Habilitar botões de exportação
                 self.btn_exportar_txt.config(state="normal")
                 self.btn_exportar_csv.config(state="normal")
                 self.btn_exportar_xlsx.config(state="normal")
-            else:
-                self.log("Nenhum registro encontrado para o período especificado.")
-                messagebox.showinfo("Consulta", "Nenhum registro encontrado para o período especificado.")
-                # Desabilitar botões de exportação
-                self.btn_exportar_txt.config(state="disabled")
-                self.btn_exportar_csv.config(state="disabled")
-                self.btn_exportar_xlsx.config(state="disabled")
-                
-        except Exception as e:
-            self.log(f"Erro ao consultar dados: {str(e)}")
-            messagebox.showerror("Erro de Consulta", f"Falha ao consultar dados: {str(e)}")
+                self.log(f"Criados {len(self.registros_bpa)} registros de teste.")
+
+    def criar_registros_teste(self, data_inicio, data_fim, competencia, quantidade=10):
+        """Cria registros de teste para validação do sistema"""
+        registros_teste = []
+        
+        # Garantir que a competência tenha 6 dígitos (AAAAMM)
+        if len(competencia) != 6:
+            competencia = datetime.datetime.now().strftime("%Y%m")  # Formato AAAAMM
+        
+        # Gerar datas aleatórias dentro do intervalo
+        import random
+        delta = (data_fim - data_inicio).days
+        
+        # Usar o tipo de procedimento da APAE
+        tipos_procedimentos = [
+            ('0301070040', '002', 'F84'),  # Atendimento/Acompanhamento psicopedagógico (Reab. Intelectual)
+            ('0301070075', '002', 'F84'),  # Atendimento em oficina terapêutica (Reab. Intelectual)
+            ('0301070105', '003', 'M638'), # Atendimento fisioterapêutico (Reab. Física)
+            ('0302050019', '003', 'M968'), # Atendimento fonoaudiológico (Reab. Física)
+            ('0302050027', '003', 'M998'), # Atendimento terapêutico em psicomotricidade (Reab. Física)
+            ('0211070300', '005', 'H919')  # Audiometria (Reab. Auditiva)
+        ]
+        
+        # Gerar registros
+        for i in range(quantidade):
+            # Gerar uma data aleatória no intervalo
+            dias_aleatorios = random.randint(0, max(0, delta))
+            data_atendimento = data_inicio + datetime.timedelta(days=dias_aleatorios)
+            
+            # Selecionar um tipo de procedimento aleatório
+            proc_info = random.choice(tipos_procedimentos)
+            cod_proc, classificacao, cid = proc_info
+            
+            # Folha e sequência
+            folha = (i // 20) + 1
+            sequencia = (i % 20) + 1
+            
+            # Criar registro BPA-I com dados fictícios
+            registro_teste = {
+                'prd_ident': '03',  # Identificação de linha de produção BPA-I
+                'prd_cnes': self.exporter.config['cnes'].zfill(7),  # Código CNES
+                'prd_cmp': competencia,  # Competência (AAAAMM)
+                'prd_cnsmed': '123456789012345',  # CNS do Profissional (fictício)
+                'prd_cbo': '225142',  # CBO do Profissional (fictício)
+                'prd_dtaten': data_atendimento.strftime('%Y%m%d'),  # Data de atendimento
+                'prd_flh': str(folha).zfill(3),  # Número da folha
+                'prd_seq': str(sequencia).zfill(2),  # Nº sequencial da linha
+                'prd_pa': cod_proc.zfill(10),  # Código do procedimento
+                'prd_cnspac': '987654321012345',  # CNS do paciente (fictício)
+                'prd_sexo': random.choice(['M', 'F']),  # Sexo do paciente
+                'prd_ibge': '170550',  # Código IBGE do município (Colinas do Tocantins)
+                'prd_cid': cid.ljust(4),  # CID-10
+                'prd_ldade': str(random.randint(3, 65)).zfill(3),  # Idade
+                'prd_qt': str(random.randint(1, 3)).zfill(6),  # Quantidade de procedimentos
+                'prd_caten': '01',  # Caract. atendimento (01 - Eletivo)
+                'prd_naut': f"AUT{random.randint(1, 99999):05d}".ljust(13),  # Nº Autorização
+                'prd_org': 'BPA',  # Origem das informações
+                'prd_nmpac': f"PACIENTE TESTE {i+1}".ljust(30)[:30],  # Nome do paciente
+                'prd_dtnasc': (data_atendimento - datetime.timedelta(days=random.randint(365*3, 365*70))).strftime('%Y%m%d'),  # Data de nasc.
+                'prd_raca': '01',  # Raça/Cor (01 - Branca)
+                'prd_etnia': ''.zfill(4),  # Etnia
+                'prd_nac': '010',  # Nacionalidade (010 - Brasileiro)
+                'prd_srv': '135',  # Código do Serviço (135 - Reabilitação)
+                'prd_clf': classificacao.zfill(3),  # Código da Classificação
+                'prd_equipe_Seq': ''.zfill(8),  # Código Sequência Equipe
+                'prd_equipe_Area': ''.zfill(4),  # Código Área Equipe
+                'prd_cnpj': ''.zfill(14),  # CNPJ da empresa
+                'prd_cep_pcnte': '77760000',  # CEP do paciente
+                'prd_lograd_pcnte': ''.zfill(3),  # Código logradouro
+                'prd_end_pcnte': 'RUA TESTE'.ljust(30),  # Endereço do paciente
+                'prd_compl_pcnte': ''.ljust(10),  # Complemento endereço
+                'prd_num_pcnte': str(random.randint(1, 999)).ljust(5),  # Número do endereço
+                'prd_bairro_pcnte': 'CENTRO'.ljust(30),  # Bairro do paciente
+                'prd_ddtel_pcnte': '63984000000'.ljust(11),  # Telefone do paciente
+                'prd_email_pcnte': ''.ljust(40),  # E-mail do paciente
+                'prd_ine': ''.zfill(10),  # Identificação nacional de equipes
+                'prd_cpf_pcnte': ''.ljust(11),  # CPF do paciente
+                'prd_situacao_rua': 'N',  # Pessoa em situação de rua
+                'prd_fim': '\r\n'  # CR+LF
+            }
+            
+            registros_teste.append(registro_teste)
+        
+        return registros_teste
+
+    def criar_registros_teste(self, data_inicio, data_fim, competencia, quantidade=10):
+        """Cria registros de teste para validação do sistema"""
+        registros_teste = []
+        
+        # Garantir que a competência tenha 6 dígitos (AAAAMM)
+        if len(competencia) != 6:
+            competencia = datetime.datetime.now().strftime("%Y%m")  # Formato AAAAMM
+        
+        # Gerar datas aleatórias dentro do intervalo
+        import random
+        delta = (data_fim - data_inicio).days
+        
+        # Usar o tipo de procedimento da APAE
+        tipos_procedimentos = [
+            ('0301070040', '002', 'F84'),  # Atendimento/Acompanhamento psicopedagógico (Reab. Intelectual)
+            ('0301070075', '002', 'F84'),  # Atendimento em oficina terapêutica (Reab. Intelectual)
+            ('0301070105', '003', 'M638'), # Atendimento fisioterapêutico (Reab. Física)
+            ('0302050019', '003', 'M968'), # Atendimento fonoaudiológico (Reab. Física)
+            ('0302050027', '003', 'M998'), # Atendimento terapêutico em psicomotricidade (Reab. Física)
+            ('0211070300', '005', 'H919')  # Audiometria (Reab. Auditiva)
+        ]
+        
+        # Gerar registros
+        for i in range(quantidade):
+            # Gerar uma data aleatória no intervalo
+            dias_aleatorios = random.randint(0, max(0, delta))
+            data_atendimento = data_inicio + datetime.timedelta(days=dias_aleatorios)
+            
+            # Selecionar um tipo de procedimento aleatório
+            proc_info = random.choice(tipos_procedimentos)
+            cod_proc, classificacao, cid = proc_info
+            
+            # Folha e sequência
+            folha = (i // 20) + 1
+            sequencia = (i % 20) + 1
+            
+            # Criar registro BPA-I com dados fictícios
+            registro_teste = {
+                'prd_ident': '03',  # Identificação de linha de produção BPA-I
+                'prd_cnes': self.exporter.config['cnes'].zfill(7),  # Código CNES
+                'prd_cmp': competencia,  # Competência (AAAAMM)
+                'prd_cnsmed': '123456789012345',  # CNS do Profissional (fictício)
+                'prd_cbo': '225142',  # CBO do Profissional (fictício)
+                'prd_dtaten': data_atendimento.strftime('%Y%m%d'),  # Data de atendimento
+                'prd_flh': str(folha).zfill(3),  # Número da folha
+                'prd_seq': str(sequencia).zfill(2),  # Nº sequencial da linha
+                'prd_pa': cod_proc.zfill(10),  # Código do procedimento
+                'prd_cnspac': '987654321012345',  # CNS do paciente (fictício)
+                'prd_sexo': random.choice(['M', 'F']),  # Sexo do paciente
+                'prd_ibge': '170550',  # Código IBGE do município (Colinas do Tocantins)
+                'prd_cid': cid.ljust(4),  # CID-10
+                'prd_ldade': str(random.randint(3, 65)).zfill(3),  # Idade
+                'prd_qt': str(random.randint(1, 3)).zfill(6),  # Quantidade de procedimentos
+                'prd_caten': '01',  # Caract. atendimento (01 - Eletivo)
+                'prd_naut': f"AUT{random.randint(1, 99999):05d}".ljust(13),  # Nº Autorização
+                'prd_org': 'BPA',  # Origem das informações
+                'prd_nmpac': f"PACIENTE TESTE {i+1}".ljust(30)[:30],  # Nome do paciente
+                'prd_dtnasc': (data_atendimento - datetime.timedelta(days=random.randint(365*3, 365*70))).strftime('%Y%m%d'),  # Data de nasc.
+                'prd_raca': '01',  # Raça/Cor (01 - Branca)
+                'prd_etnia': ''.zfill(4),  # Etnia
+                'prd_nac': '010',  # Nacionalidade (010 - Brasileiro)
+                'prd_srv': '135',  # Código do Serviço (135 - Reabilitação)
+                'prd_clf': classificacao.zfill(3),  # Código da Classificação
+                'prd_equipe_Seq': ''.zfill(8),  # Código Sequência Equipe
+                'prd_equipe_Area': ''.zfill(4),  # Código Área Equipe
+                'prd_cnpj': ''.zfill(14),  # CNPJ da empresa
+                'prd_cep_pcnte': '77760000',  # CEP do paciente
+                'prd_lograd_pcnte': ''.zfill(3),  # Código logradouro
+                'prd_end_pcnte': 'RUA TESTE'.ljust(30),  # Endereço do paciente
+                'prd_compl_pcnte': ''.ljust(10),  # Complemento endereço
+                'prd_num_pcnte': str(random.randint(1, 999)).ljust(5),  # Número do endereço
+                'prd_bairro_pcnte': 'CENTRO'.ljust(30),  # Bairro do paciente
+                'prd_ddtel_pcnte': '63984000000'.ljust(11),  # Telefone do paciente
+                'prd_email_pcnte': ''.ljust(40),  # E-mail do paciente
+                'prd_ine': ''.zfill(10),  # Identificação nacional de equipes
+                'prd_cpf_pcnte': ''.ljust(11),  # CPF do paciente
+                'prd_situacao_rua': 'N',  # Pessoa em situação de rua
+                'prd_fim': '\r\n'  # CR+LF
+            }
+            
+            registros_teste.append(registro_teste)
+        
+        return registros_teste
+
     
     def exportar_txt(self):
         """Exporta os dados para arquivo TXT no formato BPA"""
