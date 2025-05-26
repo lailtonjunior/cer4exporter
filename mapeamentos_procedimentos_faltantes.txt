@@ -1,0 +1,10 @@
+Relatório de Mapeamentos de Procedimentos Faltantes em tabela_proc_cid (gerado em: 2025-05-26 17:24:09)
+==================================================================================================================
+Os seguintes 'Códigos Curtos' (vindos de sigh.procedimentos.codigo_procedimento) precisam ser adicionados
+à função 'carregar_tabela_procedimentos_cid' no arquivo bpa_exporter.py com seus respectivos códigos SIGTAP.
+O 'ID Original do BD' refere-se ao 'cod_proc' da tabela sigh.lancamentos (que é o 'id_procedimento' em sigh.procedimentos).
+
+Código Curto Faltante: '135' (Originado do ID Original do BD: 1344)
+Código Curto Faltante: '284' (Originado do ID Original do BD: 1435)
+Código Curto Faltante: '68' (Originado do ID Original do BD: 1331)
+Código Curto Faltante: '74' (Originado do ID Original do BD: 1355)
