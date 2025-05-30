@@ -555,7 +555,7 @@ class BPAExporter:
             
             cid_final_fallback = 'Z000' # Default padrão se CID for obrigatório e não encontrado
             if not cid_obrigatorio_para_este_procedimento:
-                cid_final_fallback = '0000' # Novo default para CID não obrigatório
+                cid_final_fallback = '    ' # Novo default para CID não obrigatório
 
 
             cid_val_db = (lanc_cod_cid_val or diagnostico_val or cid_sugestao_local or cid_final_fallback).upper()
@@ -564,7 +564,7 @@ class BPAExporter:
             # Apenas se todas as fontes + sugestão forem vazias E CID não é obrigatório, use '0000'.
             if not lanc_cod_cid_val and not diagnostico_val and not (cid_sugestao_local and cid_sugestao_local.strip()):
                 if not cid_obrigatorio_para_este_procedimento:
-                    cid_val_db = '0000'
+                    cid_val_db = '    '
                 else:
                     cid_val_db = 'Z000' # Se obrigatório e tudo vazio, mantém Z000
 
